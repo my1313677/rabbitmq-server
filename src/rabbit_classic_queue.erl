@@ -7,7 +7,8 @@
 -export([
          is_enabled/0,
          declare/2,
-         delete/4
+         delete/4,
+         stat/1
          ]).
 
 -export([delete_crashed/1,
@@ -65,6 +66,12 @@ delete(Q, IfUnused, IfEmpty, ActingUser) when ?amqqueue_is_classic(Q) ->
             {ok, 0}
     end.
 
+stat(Q) ->
+    delegate:invoke(amqqueue:get_pid(Q),
+                    {gen_server2, call, [stat, infinity]}).
+
+
+%% internal-ish
 -spec wait_for_promoted_or_stopped(amqqueue:amqqueue()) ->
     {promoted, amqqueue:amqqueue()} |
     {stopped, amqqueue:amqqueue()} |

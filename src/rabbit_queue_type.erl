@@ -5,7 +5,8 @@
          default/0,
          is_enabled/1,
          declare/2,
-         delete/4
+         delete/4,
+         stat/1
          ]).
 
 % copied from rabbit_amqqueue
@@ -56,3 +57,10 @@ declare(Q, Node) ->
 delete(Q, IfUnused, IfEmpty, ActingUser) ->
     Mod = amqqueue:get_type(Q),
     Mod:delete(Q, IfUnused, IfEmpty, ActingUser).
+
+
+-spec stat(amqqueue:amqqueue()) ->
+    {'ok', non_neg_integer(), non_neg_integer()}.
+stat(Q) ->
+    Mod = amqqueue:get_type(Q),
+    Mod:stat(Q).

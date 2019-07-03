@@ -1064,9 +1064,8 @@ get_queue_consumer_info(Q, ConsumerInfoKeys) ->
 
 -spec stat(amqqueue:amqqueue()) ->
           {'ok', non_neg_integer(), non_neg_integer()}.
-
-stat(Q) when ?amqqueue_is_quorum(Q) -> rabbit_quorum_queue:stat(Q);
-stat(Q) -> delegate:invoke(amqqueue:get_pid(Q), {gen_server2, call, [stat, infinity]}).
+stat(Q) ->
+    rabbit_queue_type:stat(Q).
 
 -spec pid_of(amqqueue:amqqueue()) ->
           {'ok', pid()} | rabbit_types:error('not_found').
