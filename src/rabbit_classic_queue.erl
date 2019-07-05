@@ -4,11 +4,22 @@
 -include("amqqueue.hrl").
 -include_lib("rabbit_common/include/rabbit.hrl").
 
+-record(?MODULE, {}).
+-define(STATE, ?MODULE).
+
+-opaque state() :: #?STATE{}.
+
+-export_type([state/0]).
+
 -export([
          is_enabled/0,
          declare/2,
          delete/4,
-         stat/1
+         stat/1,
+         init/1,
+         consume/3,
+         cancel/6,
+         handle_event/2
          ]).
 
 -export([delete_crashed/1,
@@ -70,6 +81,47 @@ stat(Q) ->
     delegate:invoke(amqqueue:get_pid(Q),
                     {gen_server2, call, [stat, infinity]}).
 
+-spec init(amqqueue:amqqueue()) -> state().
+init(Q) when ?amqqueue_is_classic(Q) ->
+    #?STATE{}.
+
+consume(Q, Spec, State) when ?amqqueue_is_classic(Q) ->
+    QPid = amqqueue:get_pid(Q),
+    #{no_ack := NoAck,
+      channel_pid := ChPid,
+      limiter_pid := LimiterPid,
+      limiter_active := LimiterActive,
+      prefetch_count := ConsumerPrefetchCount,
+      consumer_tag := ConsumerTag,
+      exclusive_consume := ExclusiveConsume,
+      args := Args,
+      ok_msg := OkMsg,
+      acting_user :=  ActingUser} = Spec,
+    case delegate:invoke(QPid,
+                         {gen_server2, call,
+                          [{basic_consume, NoAck, ChPid, LimiterPid,
+                            LimiterActive, ConsumerPrefetchCount, ConsumerTag,
+                            ExclusiveConsume, Args, OkMsg, ActingUser},
+                           infinity]}) of
+        ok ->
+            %% ask the host process to monitor this pid
+            {ok, State, [{monitor, QPid, QPid}]};
+        Err ->
+            Err
+    end.
+
+cancel(Q, ChPid, ConsumerTag, OkMsg, ActingUser, State) ->
+    QPid = amqqueue:get_pid(Q),
+    case delegate:invoke(QPid, {gen_server2, call,
+                                [{basic_cancel, ChPid, ConsumerTag,
+                                  OkMsg, ActingUser}, infinity]}) of
+        ok ->
+            {ok, State};
+        Err -> Err
+    end.
+
+handle_event(_Evt, State) ->
+    {ok, State, []}.
 
 %% internal-ish
 -spec wait_for_promoted_or_stopped(amqqueue:amqqueue()) ->

@@ -1,4 +1,5 @@
 -module(rabbit_queue_type).
+-include("amqqueue.hrl").
 
 -export([
          discover/1,
@@ -6,11 +7,53 @@
          is_enabled/1,
          declare/2,
          delete/4,
-         stat/1
+         stat/1,
+         new/2,
+         consume/3,
+         cancel/6,
+         handle_event/3,
+         deliver/3
          ]).
+
+%% temporary
+-export([with/3]).
+
+-type queue_ref() :: pid() | atom().
+-type queue_state() :: term().
+
+%% anything that the host process needs to do on behalf of the queue type
+%% session, like knowing when to notify on monitor down
+-type action() :: {notify_down, Monitor :: reference(), queue_ref()}.
+-type actions() :: [action()].
+
+-record(ctx, {module :: module(),
+              state :: queue_state()}).
+
+-opaque ctxs() :: #{queue_ref() => #ctx{}}.
+
+-type consume_spec() :: #{no_ack := boolean(),
+                          channel_pid := pid(),
+                          limiter_pid => pid(),
+                          limiter_active => boolean(),
+                          prefetch_count => non_neg_integer(),
+                          consumer_tag := rabbit_types:ctag(),
+                          exclusive_consume => boolean(),
+                          args => rabbit_framing:amqp_table(),
+                          ok_msg := term(),
+                          acting_user :=  rabbit_types:username()}.
+
+
+-export_type([ctxs/0,
+              consume_spec/0,
+              action/0,
+              actions/0]).
+
 
 % copied from rabbit_amqqueue
 -type absent_reason() :: 'nodedown' | 'crashed' | stopped | timeout.
+
+%% intitialise and return a queue type specific session context
+-callback init(amqqueue:amqqueue()) -> term().
 
 %% is the queue type feature enabled
 -callback is_enabled() -> boolean().
@@ -26,6 +69,32 @@
                  rabbit_types:username()) ->
     rabbit_types:ok(non_neg_integer()) |
     rabbit_types:error(in_use | not_empty).
+
+-callback consume(amqqueue:amqqueue(),
+                  consume_spec(),
+                  queue_state()) ->
+    {ok, queue_state(), actions()} | {error, term()}.
+
+-callback cancel(amqqueue:amqqueue(), pid(),
+             rabbit_types:ctag(),
+             term(),
+             rabbit_types:username(),
+             queue_state()) ->
+    {ok, queue_state(), actions()} | {error, term()}.
+
+-callback handle_event(Event :: term(),
+                       queue_state()) ->
+    {ok, queue_state(), actions()} | {error, term()}.
+
+-callback deliver([{amqqueue:amqqueue(), queue_state()}],
+                  Delivery :: term()) ->
+    {[{amqqueue:amqqueue(), queue_state()}], actions()}.
+
+
+% basic_consume(Q, Spec
+%               NoAck, ChPid, _LimiterPid, _LimiterActive, ConsumerPrefetchCount,
+%               ConsumerTag, ExclusiveConsume, Args, OkMsg,
+%               ActingUser, QStates)
 
 %% TODO: this should be controlled by a registry that is populated on boot
 discover(<<"quorum">>) ->
@@ -48,10 +117,8 @@ declare(Q, Node) ->
     Mod = amqqueue:get_type(Q),
     Mod:declare(Q, Node).
 
--spec delete(amqqueue:amqqueue(),
-                 boolean(),
-                 boolean(),
-                 rabbit_types:username()) ->
+-spec delete(amqqueue:amqqueue(), boolean(),
+             boolean(), rabbit_types:username()) ->
     rabbit_types:ok(non_neg_integer()) |
     rabbit_types:error(in_use | not_empty).
 delete(Q, IfUnused, IfEmpty, ActingUser) ->
@@ -64,3 +131,117 @@ delete(Q, IfUnused, IfEmpty, ActingUser) ->
 stat(Q) ->
     Mod = amqqueue:get_type(Q),
     Mod:stat(Q).
+
+-spec new(amqqueue:amqqueue(), ctxs()) -> ctxs().
+new(Q, Ctxs) when ?is_amqqueue(Q) ->
+    Mod = amqqueue:get_type(Q),
+    Ctx = #ctx{module = Mod,
+               state = Mod:init(Q)},
+    Ctxs#{qref(Q) => Ctx}.
+
+-spec consume(amqqueue:amqqueue(), consume_spec(), ctxs()) ->
+    {ok, ctxs(), actions()} | {error, term()}.
+consume(Q, Spec, Ctxs) ->
+    #ctx{state = State0} = Ctx = get_ctx(Q, Ctxs),
+    Mod = amqqueue:get_type(Q),
+    case Mod:consume(Q, Spec, State0) of
+        {ok, State, Actions} ->
+            {ok, set_ctx(Q, Ctx#ctx{state = State}, Ctxs), Actions};
+        Err ->
+            Err
+    end.
+
+%% TODO switch to cancel spec api
+-spec cancel(amqqueue:amqqueue(), pid(),
+             rabbit_types:ctag(),
+             term(),
+             rabbit_types:username(),
+             ctxs()) ->
+    {ok, ctxs(), actions()} | {error, term()}.
+cancel(Q, ChPid, Tag, OkMsg, ActiveUser, Ctxs) ->
+    #ctx{state = State0} = Ctx = get_ctx(Q, Ctxs),
+    Mod = amqqueue:get_type(Q),
+    case Mod:cancel(Q, ChPid, Tag, OkMsg, ActiveUser, State0) of
+        {ok, State} ->
+            {ok, set_ctx(Q, Ctx#ctx{state = State}, Ctxs)};
+        Err ->
+            Err
+    end.
+
+%% messages sent from queues
+-spec handle_event(queue_ref(), term(), ctxs()) ->
+    {ok, ctxs(), actions()} | {error, term()}.
+handle_event(QRef, Evt, Ctxs) ->
+    #ctx{module = Mod,
+         state = State0} = Ctx = get_ctx(QRef, Ctxs),
+    case Mod:handle_event(Evt, State0) of
+        {ok, State, Actions} ->
+            {ok, set_ctx(QRef, Ctx#ctx{state = State}, Ctxs), Actions};
+        Err ->
+            Err
+    end.
+
+
+deliver(Qs, Delivery, Ctxs) ->
+    %% sort by queue type - then dispatch each group
+    ByType = lists:foldl(fun (Q, Acc) ->
+                                 T = amqqueue:get_type(Q),
+                                 Ctx = get_ctx(Q, Ctxs),
+                                 maps:update_with(
+                                   T, fun (A) ->
+                                              Ctx = get_ctx(Q, Ctxs),
+                                              [{Q, Ctx#ctx.state} | A]
+                                      end, [{Q, Ctx#ctx.state}], Acc)
+                         end, #{}, Qs),
+    %%% dispatch each group to queue type interface?
+    {Xs, Actions} = maps:fold(fun(Mod, QSs, {X0, A0}) ->
+                                      {X, A} = Mod:deliver(QSs, Delivery),
+                                      {X0 ++ X, A0 ++ A}
+                              end, {[], []}, ByType),
+    {lists:foldl(
+       fun({Q, S}, Acc) ->
+               Ctx = get_ctx(Q, Acc),
+               set_ctx(qref(Q), Ctx#ctx{state = S}, Acc)
+       end, Ctxs, Xs), Actions}.
+
+
+
+
+%% temprary
+with(QRef, Fun, Ctxs) ->
+    #ctx{state = State0} = Ctx = get_ctx(QRef, Ctxs),
+    {Res, State} = Fun(State0),
+    {Res, set_ctx(QRef, Ctx#ctx{state = State}, Ctxs)}.
+
+
+get_ctx(Q, Contexts) when ?is_amqqueue(Q) ->
+    Ref = qref(Q),
+    case Contexts of
+        #{Ref := Ctx} ->
+            Ctx;
+        _ ->
+            %% not found - initialize
+            Mod = amqqueue:get_type(Q),
+            #ctx{module = Mod,
+                 state = Mod:init(Q)}
+    end;
+get_ctx(QPid, Contexts) when is_map(Contexts) ->
+    Ref = qref(QPid),
+    %% if we use a QPid it should always be initialised
+    maps:get(Ref, Contexts).
+
+set_ctx(Q, Ctx, Contexts)
+  when ?is_amqqueue(Q) andalso is_map(Contexts) ->
+    Ref = qref(Q),
+    maps:put(Ref, Ctx, Contexts);
+set_ctx(QPid, Ctx, Contexts) when is_map(Contexts) ->
+    Ref = qref(QPid),
+    maps:put(Ref, Ctx, Contexts).
+
+qref(Pid) when is_pid(Pid) ->
+    Pid;
+qref(Q) when ?is_amqqueue(Q) ->
+    qref(amqqueue:get_pid(Q));
+qref({Name, _}) -> Name;
+%% assume it already is a ref
+qref(Ref) -> Ref.
