@@ -4,7 +4,7 @@
 -include("amqqueue.hrl").
 -include_lib("rabbit_common/include/rabbit.hrl").
 
--record(?MODULE, {}).
+-record(?MODULE, {pid :: pid()}).
 -define(STATE, ?MODULE).
 
 -opaque state() :: #?STATE{}.
@@ -19,7 +19,11 @@
          init/1,
          consume/3,
          cancel/6,
-         handle_event/2
+         handle_event/2,
+         deliver/2,
+         settle/4,
+         reject/4,
+         credit/4
          ]).
 
 -export([delete_crashed/1,
@@ -83,7 +87,7 @@ stat(Q) ->
 
 -spec init(amqqueue:amqqueue()) -> state().
 init(Q) when ?amqqueue_is_classic(Q) ->
-    #?STATE{}.
+    #?STATE{pid = amqqueue:get_pid(Q)}.
 
 consume(Q, Spec, State) when ?amqqueue_is_classic(Q) ->
     QPid = amqqueue:get_pid(Q),
@@ -120,9 +124,62 @@ cancel(Q, ChPid, ConsumerTag, OkMsg, ActingUser, State) ->
         Err -> Err
     end.
 
+-spec settle(rabbit_types:ctag(), [non_neg_integer()],
+             ChPid :: pid(), state()) ->
+    state().
+settle(_CTag, MsgIds, ChPid, State) ->
+    delegate:invoke_no_result(State#?STATE.pid,
+                              {gen_server2, cast, [{ack, MsgIds, ChPid}]}),
+    State.
+
+reject(_CTag, Requeue, MsgIds, State) ->
+    ChPid = self(),
+    ok = delegate:invoke_no_result(State#?STATE.pid,
+                                   {gen_server2, cast,
+                                    [{reject, Requeue, MsgIds, ChPid}]}),
+    State.
+
+credit(CTag, Credit, Drain, State) ->
+    ChPid = self(),
+    delegate:invoke_no_result(State#?STATE.pid,
+                              {gen_server2, cast,
+                                     [{credit, ChPid, CTag, Credit, Drain}]}),
+    State.
+
 handle_event(_Evt, State) ->
     {ok, State, []}.
 
+-spec deliver([{amqqueue:amqqueue(), state()}],
+                  Delivery :: term()) ->
+    {[{amqqueue:amqqueue(), state()}], rabbit_queue_type:actions()}.
+deliver(Qs, #delivery{flow = Flow,
+                      confirm = _Confirm} = Delivery) ->
+    {MPids, SPids, Actions} = qpids(Qs),
+    QPids = MPids ++ SPids,
+    case Flow of
+        %% Here we are tracking messages sent by the rabbit_channel
+        %% process. We are accessing the rabbit_channel process
+        %% dictionary.
+        flow   -> [credit_flow:send(QPid) || QPid <- QPids],
+                  [credit_flow:send(QPid) || QPid <- SPids];
+        noflow -> ok
+    end,
+    MMsg = {deliver, Delivery, false},
+    SMsg = {deliver, Delivery, true},
+    rabbit_log:info("rabbit_classic_queue delivery confirm  ~w", [_Confirm, MMsg]),
+    delegate:invoke_no_result(MPids, {gen_server2, cast, [MMsg]}),
+    delegate:invoke_no_result(SPids, {gen_server2, cast, [SMsg]}),
+    %% TODO: monitors
+    {Qs, Actions}.
+
+qpids(Qs) ->
+    lists:foldl(fun ({Q, _}, {MPidAcc, SPidAcc, Actions0}) ->
+                        QPid = amqqueue:get_pid(Q),
+                        SPids = amqqueue:get_slave_pids(Q),
+                        Actions = [{monitor, QPid, QPid}
+                                   | [{monitor, P, QPid} || P <- SPids]] ++ Actions0,
+                        {[QPid | MPidAcc], SPidAcc ++ SPids, Actions}
+                end, {[], [], []}, Qs).
 %% internal-ish
 -spec wait_for_promoted_or_stopped(amqqueue:amqqueue()) ->
     {promoted, amqqueue:amqqueue()} |

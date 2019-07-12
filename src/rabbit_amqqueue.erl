@@ -24,7 +24,7 @@
 -export([lookup/1, not_found_or_absent/1, with/2, with/3, with_or_die/2,
          assert_equivalence/5,
          check_exclusive_access/2, with_exclusive_access_or_die/3,
-         stat/1, deliver/2, deliver/3, requeue/4, ack/4, reject/5]).
+         stat/1, deliver/2, deliver/3, requeue/4, ack/4, reject/4]).
 -export([not_found/1, absent/2]).
 -export([list/0, list/1, info_keys/0, info/1, info/2, info_all/1, info_all/2,
          emit_info_all/5, list_local/1, info_local/1,
@@ -36,7 +36,7 @@
 -export([consumers/1, consumers_all/1,  emit_consumers_all/4, consumer_info_keys/0]).
 -export([basic_get/6, basic_consume/12, basic_cancel/6, notify_decorators/1]).
 -export([notify_sent/2, notify_sent_queue_down/1, resume/2]).
--export([notify_down_all/2, notify_down_all/3, activate_limit_all/2, credit/6]).
+-export([notify_down_all/2, notify_down_all/3, activate_limit_all/2, credit/5]).
 -export([on_node_up/1, on_node_down/1]).
 -export([update/2, store_queue/1, update_decorators/1, policy_changed/2]).
 -export([update_mirroring/1, sync_mirrors/1, cancel_sync_mirrors/1]).
@@ -1126,67 +1126,29 @@ purge(Q) when ?amqqueue_is_quorum(Q) ->
     NodeId = amqqueue:get_pid(Q),
     rabbit_quorum_queue:purge(NodeId).
 
--spec requeue(pid() | amqqueue:ra_server_id(),
+-spec requeue(pid() | atom(),
               {rabbit_fifo:consumer_tag(), [msg_id()]},
               pid(),
-              quorum_states()) ->
-    'ok'.
-requeue(QPid, {_, MsgIds}, ChPid, QuorumStates) when ?IS_CLASSIC(QPid) ->
-    ok = delegate:invoke(QPid, {gen_server2, call, [{requeue, MsgIds, ChPid}, infinity]}),
-    QuorumStates;
-requeue({Name, _} = QPid, {CTag, MsgIds}, _ChPid, QuorumStates)
-  when ?IS_QUORUM(QPid) ->
-    case QuorumStates of
-        #{Name := QState0} ->
-            {ok, QState} = rabbit_quorum_queue:requeue(CTag, MsgIds, QState0),
-            maps:put(Name, QState, QuorumStates);
-        _ ->
-            % queue was not found
-            QuorumStates
-    end.
+              quorum_states()) -> ok.
+requeue(QRef, {CTag, MsgIds}, _ChPid, QStates) ->
+    reject(QRef, true, {CTag, MsgIds}, QStates).
 
 -spec ack(pid(),
           {rabbit_fifo:consumer_tag(), [msg_id()]},
           pid(),
           quorum_states()) ->
     quorum_states().
+ack(QPid, {CTag, MsgIds}, ChPid, QueueStates) ->
+    rabbit_queue_type:settle(QPid, CTag, MsgIds, ChPid, QueueStates).
 
-ack(QPid, {_, MsgIds}, ChPid, QueueStates) when ?IS_CLASSIC(QPid) ->
-    delegate:invoke_no_result(QPid, {gen_server2, cast, [{ack, MsgIds, ChPid}]}),
-    QueueStates;
-ack({Name, _} = QPid, {CTag, MsgIds}, _ChPid, QuorumStates)
-  when ?IS_QUORUM(QPid) ->
-    case QuorumStates of
-        #{Name := QState0} ->
-            {ok, QState} = rabbit_quorum_queue:ack(CTag, MsgIds, QState0),
-            maps:put(Name, QState, QuorumStates);
-        _ ->
-            %% queue was not found
-            QuorumStates
-    end.
 
--spec reject(pid() | amqqueue:ra_server_id(),
+-spec reject(pid() | atom(),
              boolean(),
              {rabbit_fifo:consumer_tag(), [msg_id()]},
-             pid(),
              quorum_states()) ->
     quorum_states().
-
-reject(QPid, Requeue, {_, MsgIds}, ChPid, QStates) when ?IS_CLASSIC(QPid) ->
-    ok = delegate:invoke_no_result(QPid, {gen_server2, cast,
-                                          [{reject, Requeue, MsgIds, ChPid}]}),
-    QStates;
-reject({Name, _} = QPid, Requeue, {CTag, MsgIds}, _ChPid, QuorumStates)
-  when ?IS_QUORUM(QPid) ->
-    case QuorumStates of
-        #{Name := QState0} ->
-            {ok, QState} = rabbit_quorum_queue:reject(Requeue, CTag,
-                                                      MsgIds, QState0),
-            maps:put(Name, QState, QuorumStates);
-        _ ->
-            %% queue was not found
-            QuorumStates
-    end.
+reject(QRef, Requeue, {CTag, MsgIds}, QStates) ->
+    rabbit_queue_type:reject(QRef, CTag, Requeue, MsgIds, QStates).
 
 -spec notify_down_all(qpids(), pid()) -> ok_or_errors().
 
@@ -1221,33 +1183,29 @@ activate_limit_all(QRefs, ChPid) ->
                                       [{activate_limit, ChPid}]}).
 
 -spec credit(amqqueue:amqqueue(),
-             pid(),
              rabbit_types:ctag(),
              non_neg_integer(),
              boolean(),
              quorum_states()) ->
-    {'ok', quorum_states()}.
+    quorum_states().
+credit(Q, CTag, Credit, Drain, QStates) ->
+    rabbit_queue_type:credit(Q, CTag, Credit, Drain, QStates).
 
-credit(Q, ChPid, CTag, Credit,
-       Drain, QStates) when ?amqqueue_is_classic(Q) ->
-    QPid = amqqueue:get_pid(Q),
-    delegate:invoke_no_result(QPid, {gen_server2, cast,
-                                     [{credit, ChPid, CTag, Credit, Drain}]}),
-    {ok, QStates};
-credit(Q, _ChPid, CTag, Credit,
-       Drain, QStates) when ?amqqueue_is_quorum(Q) ->
-    {QRef, _} = amqqueue:get_pid(Q),
-    rabbit_queue_type:with(
-      QRef,
-      fun(S) ->
-              rabbit_quorum_queue:credit(CTag, Credit, Drain, S)
-      end,
-      QStates).
-
-%     {ok, 
-%     QState0 = get_quorum_state(Id, QName, QStates),
-%     {ok, QState} = rabbit_quorum_queue:credit(CTag, Credit, Drain, QState0),
-%     {ok, maps:put(Name, QState, QStates)}.
+% credit(Q, ChPid, CTag, Credit, Drain, QStates)
+%   when ?amqqueue_is_classic(Q) ->
+%     QPid = amqqueue:get_pid(Q),
+%     delegate:invoke_no_result(QPid, {gen_server2, cast,
+%                                      [{credit, ChPid, CTag, Credit, Drain}]}),
+%     {ok, QStates};
+% credit(Q, _ChPid, CTag, Credit,
+%        Drain, QStates) when ?amqqueue_is_quorum(Q) ->
+%     {QRef, _} = amqqueue:get_pid(Q),
+%     rabbit_queue_type:with(
+%       QRef,
+%       fun(S) ->
+%               rabbit_quorum_queue:credit(CTag, Credit, Drain, S)
+%       end,
+%       QStates).
 
 -spec basic_get(amqqueue:amqqueue(), pid(), boolean(), pid(), rabbit_types:ctag(),
                 #{Name :: atom() => rabbit_fifo_client:state()}) ->
@@ -1262,9 +1220,8 @@ basic_get(Q, ChPid, NoAck, LimiterPid, _CTag, _)
                            [{basic_get, ChPid, NoAck, LimiterPid}, infinity]});
 basic_get(Q, _ChPid, NoAck, _LimiterPid, CTag, QStates0)
   when ?amqqueue_is_quorum(Q) ->
-    {QRef, _} = amqqueue:get_pid(Q),
     case rabbit_queue_type:with(
-           QRef,
+           Q,
            fun(S0) ->
                    case rabbit_quorum_queue:basic_get(Q, NoAck, CTag, S0) of
                        {ok, empty, S} ->

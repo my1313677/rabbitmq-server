@@ -12,21 +12,31 @@
          consume/3,
          cancel/6,
          handle_event/3,
-         deliver/3
+         deliver/3,
+         settle/5,
+         reject/5,
+         credit/5,
+
+         name/2
          ]).
 
 %% temporary
 -export([with/3]).
 
 -type queue_ref() :: pid() | atom().
+-type queue_name() :: rabbit_types:r(queue).
 -type queue_state() :: term().
 
 %% anything that the host process needs to do on behalf of the queue type
 %% session, like knowing when to notify on monitor down
--type action() :: {notify_down, Monitor :: reference(), queue_ref()}.
+-type action() ::
+    {monitor, Pid :: pid(), queue_ref()} |
+    {deliver, rabbit_type:ctag(), boolean(), [rabbit_amqqueue:qmsg()]}.
+
 -type actions() :: [action()].
 
 -record(ctx, {module :: module(),
+              name :: queue_name(),
               state :: queue_state()}).
 
 -opaque ctxs() :: #{queue_ref() => #ctx{}}.
@@ -84,17 +94,23 @@
 
 -callback handle_event(Event :: term(),
                        queue_state()) ->
-    {ok, queue_state(), actions()} | {error, term()}.
+    {ok, queue_state(), actions()} | {error, term()} | eol.
 
 -callback deliver([{amqqueue:amqqueue(), queue_state()}],
                   Delivery :: term()) ->
     {[{amqqueue:amqqueue(), queue_state()}], actions()}.
 
+-callback settle(rabbit_types:ctag(), [non_neg_integer()],
+                 ChPid :: pid(), queue_state()) ->
+    queue_state().
 
-% basic_consume(Q, Spec
-%               NoAck, ChPid, _LimiterPid, _LimiterActive, ConsumerPrefetchCount,
-%               ConsumerTag, ExclusiveConsume, Args, OkMsg,
-%               ActingUser, QStates)
+-callback reject(rabbit_types:ctag(), Requeue :: boolean(),
+                 MsgIds :: [non_neg_integer()], queue_state()) ->
+    queue_state().
+
+-callback credit(rabbit_types:ctag(),
+                 non_neg_integer(), Drain :: boolean(), queue_state()) ->
+    queue_state().
 
 %% TODO: this should be controlled by a registry that is populated on boot
 discover(<<"quorum">>) ->
@@ -135,7 +151,9 @@ stat(Q) ->
 -spec new(amqqueue:amqqueue(), ctxs()) -> ctxs().
 new(Q, Ctxs) when ?is_amqqueue(Q) ->
     Mod = amqqueue:get_type(Q),
+    Name = amqqueue:get_name(Q),
     Ctx = #ctx{module = Mod,
+               name = Name,
                state = Mod:init(Q)},
     Ctxs#{qref(Q) => Ctx}.
 
@@ -205,9 +223,33 @@ deliver(Qs, Delivery, Ctxs) ->
        end, Ctxs, Xs), Actions}.
 
 
+settle(QRef, CTag, MsgIds, ChPid, Ctxs) ->
+    #ctx{state = State0,
+         module = Mod} = Ctx = get_ctx(QRef, Ctxs),
+    State = Mod:settle(CTag, MsgIds, ChPid, State0),
+    set_ctx(QRef, Ctx#ctx{state = State}, Ctxs).
 
+reject(QRef, CTag, Requeue, MsgIds, Ctxs) ->
+    #ctx{state = State0,
+         module = Mod} = Ctx = get_ctx(QRef, Ctxs),
+    State = Mod:reject(CTag, Requeue, MsgIds, State0),
+    set_ctx(QRef, Ctx#ctx{state = State}, Ctxs).
 
-%% temprary
+credit(Q, CTag, Credit, Drain, Ctxs) ->
+    #ctx{state = State0,
+         module = Mod} = Ctx = get_ctx(Q, Ctxs),
+    State = Mod:settle(CTag, Credit, Drain, State0),
+    set_ctx(Q, Ctx#ctx{state = State}, Ctxs).
+
+name(QRef, Ctxs) ->
+    case Ctxs of
+        #{QRef := Ctx} ->
+            Ctx#ctx.name;
+        _ ->
+            undefined
+    end.
+
+%% temporary
 with(QRef, Fun, Ctxs) ->
     #ctx{state = State0} = Ctx = get_ctx(QRef, Ctxs),
     {Res, State} = Fun(State0),
@@ -222,7 +264,9 @@ get_ctx(Q, Contexts) when ?is_amqqueue(Q) ->
         _ ->
             %% not found - initialize
             Mod = amqqueue:get_type(Q),
+            Name = amqqueue:get_name(Q),
             #ctx{module = Mod,
+                 name = Name,
                  state = Mod:init(Q)}
     end;
 get_ctx(QPid, Contexts) when is_map(Contexts) ->

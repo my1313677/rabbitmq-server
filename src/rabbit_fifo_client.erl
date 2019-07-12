@@ -234,7 +234,7 @@ settle(ConsumerTag, [_|_] = MsgIds,
                               fun ({Settles, Returns, Discards}) ->
                                       {Settles ++ MsgIds, Returns, Discards}
                               end, {MsgIds, [], []}, Unsent0),
-    {ok, State0#state{unsent_commands = Unsent}}.
+    State0#state{unsent_commands = Unsent}.
 
 %% @doc Return a message to the queue.
 %% @param ConsumerTag the tag uniquely identifying the consumer.
@@ -247,17 +247,14 @@ settle(ConsumerTag, [_|_] = MsgIds,
 %% the sending rate.
 %%
 -spec return(rabbit_fifo:consumer_tag(), [rabbit_fifo:msg_id()], state()) ->
-    {ok, state()}.
+    state().
 return(ConsumerTag, [_|_] = MsgIds, #state{slow = false} = State0) ->
     Node = pick_node(State0),
     % TODO: make rabbit_fifo return support lists of message ids
     Cmd = rabbit_fifo:make_return(consumer_id(ConsumerTag), MsgIds),
     case send_command(Node, undefined, Cmd, normal, State0) of
-        {slow, S} ->
-            % turn slow into ok for this function
-            {ok, S};
-        {ok, _} = Ret ->
-            Ret
+        {_, S} ->
+            S
     end;
 return(ConsumerTag, [_|_] = MsgIds,
        #state{unsent_commands = Unsent0} = State0) ->
@@ -268,7 +265,7 @@ return(ConsumerTag, [_|_] = MsgIds,
                               fun ({Settles, Returns, Discards}) ->
                                       {Settles, Returns ++ MsgIds, Discards}
                               end, {[], MsgIds, []}, Unsent0),
-    {ok, State0#state{unsent_commands = Unsent}}.
+    State0#state{unsent_commands = Unsent}.
 
 %% @doc Discards a checked out message.
 %% If the queue has a dead_letter_handler configured this will be called.
@@ -281,16 +278,14 @@ return(ConsumerTag, [_|_] = MsgIds,
 %% tag is `slow' it means the limit is approaching and it is time to slow down
 %% the sending rate.
 -spec discard(rabbit_fifo:consumer_tag(), [rabbit_fifo:msg_id()], state()) ->
-    {ok | slow, state()}.
+    state().
 discard(ConsumerTag, [_|_] = MsgIds, #state{slow = false} = State0) ->
     Node = pick_node(State0),
     Cmd = rabbit_fifo:make_discard(consumer_id(ConsumerTag), MsgIds),
     case send_command(Node, undefined, Cmd, normal, State0) of
-        {slow, S} ->
+        {_, S} ->
             % turn slow into ok for this function
-            {ok, S};
-        {ok, _} = Ret ->
-            Ret
+            S
     end;
 discard(ConsumerTag, [_|_] = MsgIds,
         #state{unsent_commands = Unsent0} = State0) ->
@@ -301,7 +296,7 @@ discard(ConsumerTag, [_|_] = MsgIds,
                               fun ({Settles, Returns, Discards}) ->
                                       {Settles, Returns, Discards ++ MsgIds}
                               end, {[], [], MsgIds}, Unsent0),
-    {ok, State0#state{unsent_commands = Unsent}}.
+    State0#state{unsent_commands = Unsent}.
 
 
 %% @doc Register with the rabbit_fifo queue to "checkout" messages as they
@@ -353,9 +348,14 @@ checkout(ConsumerTag, NumUnsettled, CreditMode, Meta,
                                     Meta),
     %% ???
     Ack = maps:get(ack, Meta, true),
-    SDels = maps:update(ConsumerTag, fun (_K, V) ->
-                                V#consumer{ack = Ack}
-                        end, #consumer{last_msg_id = -1}, CDels0),
+    rabbit_log:info("checkout ~w AckRequired: ~w", [ConsumerTag, Ack]),
+
+    SDels = maps:update_with(ConsumerTag,
+                             fun (V) ->
+                                     V#consumer{ack = Ack}
+                             end,
+                             #consumer{last_msg_id = -1,
+                                       ack = Ack}, CDels0),
     try_process_command(Servers, Cmd, State0#state{consumer_deliveries = SDels}).
 
 %% @doc Provide credit to the queue
@@ -370,7 +370,7 @@ checkout(ConsumerTag, NumUnsettled, CreditMode, Meta,
              Credit :: non_neg_integer(),
              Drain :: boolean(),
              state()) ->
-    {ok, state()}.
+    state().
 credit(ConsumerTag, Credit, Drain,
        #state{consumer_deliveries = CDels} = State0) ->
     ConsumerId = consumer_id(ConsumerTag),
@@ -381,11 +381,9 @@ credit(ConsumerTag, Credit, Drain,
     Cmd = rabbit_fifo:make_credit(ConsumerId, Credit,
                                   C#consumer.last_msg_id + 1, Drain),
     case send_command(Node, undefined, Cmd, normal, State0) of
-        {slow, S} ->
+        {_, S} ->
             % turn slow into ok for this function
-            {ok, S};
-        {ok, _} = Ret ->
-            Ret
+            S
     end.
 
 %% @doc Cancels a checkout with the rabbit_fifo queue  for the consumer tag
@@ -488,14 +486,14 @@ update_machine_state(Node, Conf) ->
 %% with them.</li>
 -spec handle_ra_event(ra_server_id(), ra_server_proc:ra_event_body(), state()) ->
     {internal, actions(), state()} |
-    {rabbit_fifo:client_msg(), state()} | eol.
+    {deliver, rabbit_types:ctag(), boolean(), [rabbit_amqqueue:qmsg()]} | eol.
 handle_ra_event(From, {applied, Seqs},
                 #state{soft_limit = SftLmt,
                        unblock_handler = UnblockFun} = State0) ->
     {Corrs, Actions0, State1} = lists:foldl(fun seq_applied/2,
                                            {[], [], State0#state{leader = From}},
                                            Seqs),
-    Actions = [{settled, Corrs} | lists:reverse(Actions0)],
+    Actions = [{settled, qref(From), Corrs} | lists:reverse(Actions0)],
     case maps:size(State1#state.pending) < SftLmt of
         true when State1#state.slow == true ->
             % we have exited soft limit state
@@ -525,38 +523,38 @@ handle_ra_event(From, {applied, Seqs},
                                         end
                                 end, State2, Commands),
             UnblockFun(),
-            {internal, Actions, State};
+            {ok, State, Actions};
         _ ->
-            {internal, Actions, State1}
+            {ok, State1, Actions}
     end;
 handle_ra_event(Leader, {machine, {delivery, _ConsumerTag, _} = Del}, State0) ->
     handle_delivery(Leader, Del, State0);
 handle_ra_event(Leader, {machine, leader_change},
                 #state{leader = Leader} = State) ->
     %% leader already known
-    {internal, [], State};
+    {ok, State, []};
 handle_ra_event(Leader, {machine, leader_change}, State0) ->
     %% we need to update leader
     %% and resend any pending commands
     State = resend_all_pending(State0#state{leader = Leader}),
-    {internal, [], State};
+    {ok, State, []};
 handle_ra_event(_From, {rejected, {not_leader, undefined, _Seq}}, State0) ->
     % TODO: how should these be handled? re-sent on timer or try random
-    {internal, [], State0};
+    {ok, State0, []};
 handle_ra_event(_From, {rejected, {not_leader, Leader, Seq}}, State0) ->
     % ?INFO("rabbit_fifo_client: rejected ~b not leader ~w leader: ~w~n",
     %       [Seq, From, Leader]),
     State1 = State0#state{leader = Leader},
     State = resend(Seq, State1),
-    {internal, [], State};
+    {ok, State, []};
 handle_ra_event(_, timeout, #state{servers = Servers} = State0) ->
     case find_leader(Servers) of
         undefined ->
             %% still no leader, set the timer again
-            {internal, [], set_timer(State0)};
+            {ok, set_timer(State0), []};
         Leader ->
             State = resend_all_pending(State0#state{leader = Leader}),
-            {internal, [], State}
+            {ok, State, []}
     end;
 handle_ra_event(_Leader, {machine, eol}, _State0) ->
     eol.
@@ -653,31 +651,34 @@ resend_all_pending(#state{pending = Pend} = State) ->
     Seqs = lists:sort(maps:keys(Pend)),
     lists:foldl(fun resend/2, State, Seqs).
 
-maybe_auto_ack(true, {delivery, Tag, IdMsgs}, State0) ->
+maybe_auto_ack(true, Deliver, State0) ->
     %% manual ack is enabled
-    {{delivery, Tag, false, IdMsgs}, State0};
-maybe_auto_ack(false, {delivery, Tag, IdMsgs}, State0) ->
+    {ok, State0, [Deliver]};
+maybe_auto_ack(false, {deliver, Tag, _Ack, Msgs} = Deliver, State0) ->
     %% we have to auto ack these deliveries
-    {MsgIds, _} = lists:unzip(IdMsgs),
+    MsgIds = [I || {_, _, I, _, _} <- Msgs],
     {ok, State} = settle(Tag, MsgIds, State0),
-    {{delivery, Tag, true, IdMsgs}, State}.
+    {ok, State, [Deliver]}.
 
 
-handle_delivery(Leader, {delivery, Tag, [{FstId, _} | _] = IdMsgs} = Del0,
-                #state{consumer_deliveries = CDels0} = State0) ->
+handle_delivery(Leader, {delivery, Tag, [{FstId, _} | _] = IdMsgs},
+                #state{cluster_name  = QName,
+                       consumer_deliveries = CDels0} = State0) ->
+    QRef = qref(Leader),
     {LastId, _} = lists:last(IdMsgs),
+    Consumer = #consumer{ack = Ack} = maps:get(Tag, CDels0),
+    %% format as a deliver action
+    Del = {deliver, Tag, Ack, transform_msgs(QName, QRef, IdMsgs)},
     %% TODO: remove potential default allocation
-    case maps:get(Tag, CDels0) of
-        #consumer{ack = Ack,
-                  last_msg_id = Prev} = C
+    case Consumer of
+        #consumer{last_msg_id = Prev} = C
           when FstId =:= Prev+1 ->
-            maybe_auto_ack(Ack, Del0,
+            maybe_auto_ack(Ack, Del,
                            State0#state{consumer_deliveries =
                                         update_consumer(Tag, LastId,
                                                         length(IdMsgs), C,
                                                         CDels0)});
-        #consumer{ack = Ack,
-                  last_msg_id = Prev} = C
+        #consumer{last_msg_id = Prev} = C
           when FstId > Prev+1 ->
             NumMissing = FstId - Prev + 1,
             %% there may actually be fewer missing messages returned than expected
@@ -687,8 +688,9 @@ handle_delivery(Leader, {delivery, Tag, [{FstId, _} | _] = IdMsgs} = Del0,
             %% out messages to the main queue to ensure they don't get stuck in
             %% case the node never comes back.
             Missing = get_missing_deliveries(Leader, Prev+1, FstId-1, Tag),
-            Del = {delivery, Tag, Missing ++ IdMsgs},
-            maybe_auto_ack(Ack, Del,
+            XDel = {deliver, Tag, Ack, transform_msgs(QName, QRef,
+                                                      Missing ++ IdMsgs)},
+            maybe_auto_ack(Ack, XDel,
                            State0#state{consumer_deliveries =
                                         update_consumer(Tag, LastId,
                                                         length(IdMsgs) + NumMissing,
@@ -697,25 +699,37 @@ handle_delivery(Leader, {delivery, Tag, [{FstId, _} | _] = IdMsgs} = Del0,
           when FstId =< Prev ->
             case lists:dropwhile(fun({Id, _}) -> Id =< Prev end, IdMsgs) of
                 [] ->
-                    {internal, [], State0};
+                    {ok, State0, []};
                 IdMsgs2 ->
                     handle_delivery(Leader, {delivery, Tag, IdMsgs2}, State0)
             end;
-        #consumer{ack = Ack} when FstId =:= 0 ->
+        C when FstId =:= 0 ->
             % the very first delivery
-            maybe_auto_ack(Ack, Del0,
+            maybe_auto_ack(Ack, Del,
                            State0#state{consumer_deliveries =
                                         update_consumer(Tag, LastId,
                                                         length(IdMsgs),
-                                                        #consumer{last_msg_id = LastId},
+                                                        C#consumer{last_msg_id = LastId},
                                                         CDels0)})
     end.
 
+transform_msgs(QName, QRef, Msgs) ->
+    lists:map(fun({MsgId, {MsgHeader, Msg0}}) ->
+                      IsDelivered = maps:is_key(delivery_count, MsgHeader),
+                      Msg = add_delivery_count_header(MsgHeader, Msg0),
+                      {QName, QRef, MsgId, IsDelivered, Msg}
+              end, Msgs).
+
+add_delivery_count_header(#{delivery_count := Count}, Msg) ->
+    rabbit_basic:add_header(<<"x-delivery-count">>, long, Count, Msg);
+add_delivery_count_header(_, Msg) ->
+    Msg.
+
 update_consumer(Tag, LastId, DelCntIncr,
-                #consumer{delivery_count = D}, Consumers) ->
+                #consumer{delivery_count = D} = C, Consumers) ->
     maps:put(Tag,
-             #consumer{last_msg_id = LastId,
-                       delivery_count = D + DelCntIncr},
+             C#consumer{last_msg_id = LastId,
+                        delivery_count = D + DelCntIncr},
              Consumers).
 
 
@@ -797,3 +811,5 @@ find_leader([Server | Servers]) ->
             find_leader(Servers)
     end.
 
+qref({Ref, _}) -> Ref;
+qref(Ref) -> Ref.

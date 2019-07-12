@@ -21,10 +21,10 @@
 -export([init/1, handle_event/2]).
 -export([recover/1, stop/1, delete/4, delete_immediately/2]).
 -export([info/1, info/2, stat/1, infos/1]).
--export([ack/3, reject/4, basic_get/4, consume/3, cancel/6]).
+-export([settle/4, reject/4, basic_get/4, consume/3, cancel/6]).
 -export([credit/4]).
 -export([purge/1]).
--export([stateless_deliver/2, deliver/3]).
+-export([stateless_deliver/2, deliver/3, deliver/2]).
 -export([dead_letter_publish/4]).
 -export([queue_name/1]).
 -export([cluster_state/1, status/2]).
@@ -101,9 +101,7 @@ init(Q) when ?is_amqqueue(Q) ->
 
 -spec handle_event({'ra_event', amqqueue:ra_server_id(), any()},
                    rabbit_fifo_client:state()) ->
-    {internal, Correlators :: [term()], rabbit_fifo_client:actions(),
-     rabbit_fifo_client:state()} |
-    {rabbit_fifo:client_msg(), rabbit_fifo_client:state()} |
+    {ok, rabbit_fifo_client:state(), rabbit_queue_type:actions()} |
     eol.
 handle_event({ra_event, From, Evt}, QState) ->
     rabbit_fifo_client:handle_ra_event(From, Evt, QState).
@@ -453,18 +451,16 @@ delete_immediately(Resource, {_Name, _} = QPid) ->
     rabbit_core_metrics:queue_deleted(Resource),
     ok.
 
--spec ack(rabbit_types:ctag(), [msg_id()], rabbit_fifo_client:state()) ->
-                 {'ok', rabbit_fifo_client:state()}.
+settle(CTag, MsgIds, _ChPid, QState) ->
+    {_, S} = rabbit_fifo_client:settle(quorum_ctag(CTag), MsgIds, QState),
+    S.
 
-ack(CTag, MsgIds, QState) ->
-    rabbit_fifo_client:settle(quorum_ctag(CTag), MsgIds, QState).
-
--spec reject(Confirm :: boolean(), rabbit_types:ctag(), [msg_id()], rabbit_fifo_client:state()) ->
-                    {'ok', rabbit_fifo_client:state()}.
-
-reject(true, CTag, MsgIds, QState) ->
+-spec reject(rabbit_types:ctag(), Confirm :: boolean(), [msg_id()],
+             rabbit_fifo_client:state()) ->
+    rabbit_fifo_client:state().
+reject(CTag, true, MsgIds, QState) ->
     rabbit_fifo_client:return(quorum_ctag(CTag), MsgIds, QState);
-reject(false, CTag, MsgIds, QState) ->
+reject(CTag, false, MsgIds, QState) ->
     rabbit_fifo_client:discard(quorum_ctag(CTag), MsgIds, QState).
 
 credit(CTag, Credit, Drain, QState) ->
@@ -475,7 +471,6 @@ credit(CTag, Credit, Drain, QState) ->
     {'ok', 'empty', rabbit_fifo_client:state()} |
     {'ok', QLen :: non_neg_integer(), qmsg(), rabbit_fifo_client:state()} |
     {error, timeout | term()}.
-
 basic_get(Q, NoAck, CTag0, QState0) when ?amqqueue_is_quorum(Q) ->
     QName = amqqueue:get_name(Q),
     Id = amqqueue:get_pid(Q),
@@ -582,6 +577,13 @@ deliver(false, Delivery, QState0) ->
 deliver(true, Delivery, QState0) ->
     rabbit_fifo_client:enqueue(Delivery#delivery.msg_seq_no,
                                Delivery#delivery.message, QState0).
+
+deliver(QSs, #delivery{confirm = Confirm} = Delivery) ->
+    lists:foldl(
+      fun({Q, S0}, {Qs, Actions}) ->
+              {_, S} = deliver(Confirm, Delivery, S0),
+              {[{Q, S} | Qs], Actions}
+      end, {[], []}, QSs).
 
 -spec info(amqqueue:amqqueue()) -> rabbit_types:infos().
 
