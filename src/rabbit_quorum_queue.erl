@@ -21,7 +21,7 @@
 -export([init/1, handle_event/2]).
 -export([recover/1, stop/1, delete/4, delete_immediately/2]).
 -export([state_info/1, info/2, stat/1, infos/1]).
--export([settle/4, reject/4, dequeue/4, consume/3, cancel/6]).
+-export([settle/3, reject/4, dequeue/4, consume/3, cancel/5]).
 -export([credit/4]).
 -export([purge/1]).
 -export([stateless_deliver/2, deliver/3, deliver/2]).
@@ -450,7 +450,7 @@ delete_immediately(Resource, {_Name, _} = QPid) ->
     rabbit_core_metrics:queue_deleted(Resource),
     ok.
 
-settle(CTag, MsgIds, _ChPid, QState) ->
+settle(CTag, MsgIds, QState) ->
     rabbit_fifo_client:settle(quorum_ctag(CTag), MsgIds, QState).
 
 -spec reject(rabbit_types:ctag(), Confirm :: boolean(), [msg_id()],
@@ -468,7 +468,7 @@ credit(CTag, Credit, Drain, QState) ->
               rabbit_types:ctag(), rabbit_fifo_client:state()) ->
     {empty, rabbit_fifo_client:state()} |
     {ok, QLen :: non_neg_integer(), qmsg(), rabbit_fifo_client:state()} |
-    {error, timeout | term()}.
+    {error, term()}.
 dequeue(NoAck, _LimiterPid, CTag0, QState0) ->
     CTag = quorum_ctag(CTag0),
     Settlement = case NoAck of
@@ -542,8 +542,8 @@ consume(Q, Spec, State0) when ?amqqueue_is_quorum(Q) ->
 % -spec basic_cancel(rabbit_types:ctag(), ChPid :: pid(), any(), rabbit_fifo_client:state()) ->
 %                           {'ok', rabbit_fifo_client:state()}.
 
-cancel(_Q, ChPid, ConsumerTag, OkMsg, _ActingUser, State) ->
-    maybe_send_reply(ChPid, OkMsg),
+cancel(_Q, ConsumerTag, OkMsg, _ActingUser, State) ->
+    maybe_send_reply(self(), OkMsg),
     rabbit_fifo_client:cancel_checkout(quorum_ctag(ConsumerTag), State).
 
 -spec stateless_deliver(amqqueue:ra_server_id(), rabbit_types:delivery()) -> 'ok'.
@@ -656,8 +656,8 @@ cluster_state(Name) ->
             end
     end.
 
--spec status(rabbit_types:vhost(), Name :: rabbit_misc:resource_name()) ->
-    rabbit_types:infos() | {error, term()}.
+-spec status(rabbit_types:vhost(), Name :: binary()) ->
+    [rabbit_types:infos()] | {error, term()}.
 status(Vhost, QueueName) ->
     %% Handle not found queues
     QName = #resource{virtual_host = Vhost, name = QueueName, kind = queue},

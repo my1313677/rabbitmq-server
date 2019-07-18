@@ -184,10 +184,10 @@ enqueue(Msg, State) ->
 %% @param State The {@module} state.
 %%
 %% @returns `{ok, IdMsg, State}' or `{error | timeout, term()}'
-% -spec dequeue(rabbit_fifo:consumer_tag(),
-%               Settlement :: settled | unsettled, state()) ->
-%     {ok, {rabbit_fifo:delivery_msg(), non_neg_integer()}
-%      | empty, state()} | {error | timeout, term()}.
+-spec dequeue(rabbit_fifo:consumer_tag(),
+              Settlement :: settled | unsettled, state()) ->
+    {ok, non_neg_integer(), term(), non_neg_integer()}
+     | {empty, state()} | {error | timeout, term()}.
 dequeue(ConsumerTag, Settlement, #state{timeout = Timeout,
                                         cluster_name = QName} = State0) ->
     Node = pick_node(State0),
@@ -203,16 +203,16 @@ dequeue(ConsumerTag, Settlement, #state{timeout = Timeout,
             Count = maps:get(delivery_count, MsgHeader, 0),
             IsDelivered = Count > 0,
             Msg = add_delivery_count_header(Msg0, Count),
-            {ok, MsgsReady, {QName, Leader, MsgId, IsDelivered, Msg},
+            {ok, MsgsReady,
+             {QName, Leader, MsgId, IsDelivered, Msg},
              State0#state{leader = Leader}};
-            % {ok, {Msg, NumReady}, State0#state{leader = Leader}};
         Err ->
             Err
     end.
 
-add_delivery_count_header(#delivery{} = Msg, Count)
+add_delivery_count_header(#basic_message{} = Msg0, Count)
   when is_integer(Count) ->
-    rabbit_basic:add_header(<<"x-delivery-count">>, long, Count, Msg);
+    rabbit_basic:add_header(<<"x-delivery-count">>, long, Count, Msg0);
 add_delivery_count_header(Msg, _Count) ->
     Msg.
 
@@ -227,7 +227,7 @@ add_delivery_count_header(Msg, _Count) ->
 %% the sending rate.
 %%
 -spec settle(rabbit_fifo:consumer_tag(), [rabbit_fifo:msg_id()], state()) ->
-    {ok, state()}.
+    state().
 settle(ConsumerTag, [_|_] = MsgIds, #state{slow = false} = State0) ->
     Node = pick_node(State0),
     Cmd = rabbit_fifo:make_settle(consumer_id(ConsumerTag), MsgIds),
