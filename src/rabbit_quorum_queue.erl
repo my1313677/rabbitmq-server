@@ -37,7 +37,7 @@
 -export([add_member/3]).
 -export([delete_member/3]).
 -export([requeue/3]).
--export([policy_changed/2]).
+-export([policy_changed/1]).
 -export([cleanup_data_dir/0]).
 -export([shrink_all/1,
          grow/4]).
@@ -425,7 +425,6 @@ delete(Q, _IfUnused, _IfEmpty, ActingUser) when ?amqqueue_is_quorum(Q) ->
             end
     end.
 
-
 force_delete_queue(Servers) ->
     [begin
          case catch(ra:force_delete_server(S)) of
@@ -452,8 +451,7 @@ delete_immediately(Resource, {_Name, _} = QPid) ->
     ok.
 
 settle(CTag, MsgIds, _ChPid, QState) ->
-    {_, S} = rabbit_fifo_client:settle(quorum_ctag(CTag), MsgIds, QState),
-    S.
+    rabbit_fifo_client:settle(quorum_ctag(CTag), MsgIds, QState).
 
 -spec reject(rabbit_types:ctag(), Confirm :: boolean(), [msg_id()],
              rabbit_fifo_client:state()) ->
@@ -480,18 +478,6 @@ dequeue(NoAck, _LimiterPid, CTag0, QState0) ->
                          unsettled
                  end,
     rabbit_fifo_client:dequeue(CTag, Settlement, QState0).
-        % {ok, empty, QState} ->
-        %     {ok, empty, QState};
-        % {ok, {{MsgId, {MsgHeader, Msg0}}, MsgsReady}, QState} ->
-        %     Count = maps:get(delivery_count, MsgHeader, 0),
-        %     IsDelivered = Count > 0,
-        %     Msg = rabbit_basic:add_header(<<"x-delivery-count">>, long, Count, Msg0),
-        %     {ok, MsgsReady, {QName, Id, MsgId, IsDelivered, Msg}, QState};
-        % {error, _} = Err ->
-        %     Err;
-        % {timeout, _} ->
-        %     {error, timeout}
-    % end.
 
 -spec consume(amqqueue:amqqueue(),
               rabbit_queue_type:consume_spec(),
@@ -569,7 +555,6 @@ stateless_deliver(ServerId, Delivery) ->
 -spec deliver(Confirm :: boolean(), rabbit_types:delivery(),
               rabbit_fifo_client:state()) ->
     {ok | slow, rabbit_fifo_client:state()}.
-
 deliver(false, Delivery, QState0) ->
     rabbit_fifo_client:enqueue(Delivery#delivery.message, QState0);
 deliver(true, Delivery, QState0) ->
@@ -578,7 +563,12 @@ deliver(true, Delivery, QState0) ->
 
 deliver(QSs, #delivery{confirm = Confirm} = Delivery) ->
     lists:foldl(
-      fun({Q, S0}, {Qs, Actions}) ->
+      fun({Q, stateless}, {Qs, Actions}) ->
+              QRef = amqqueue:get_pid(Q),
+              ok = rabbit_fifo_client:untracked_enqueue(
+                     [QRef], Delivery#delivery.message),
+              {Qs, Actions};
+         ({Q, S0}, {Qs, Actions}) ->
               {_, S} = deliver(Confirm, Delivery, S0),
               {[{Q, S} | Qs], Actions}
       end, {[], []}, QSs).
@@ -649,9 +639,10 @@ maybe_delete_data_dir(UId) ->
             ok
     end.
 
-policy_changed(QName, Node) ->
-    {ok, Q} = rabbit_amqqueue:lookup(QName),
-    rabbit_fifo_client:update_machine_state(Node, ra_machine_config(Q)).
+policy_changed(Q) ->
+    rabbit_log:info("PLICY CHANGE ~w", [ra_machine_config(Q)]),
+    QPid = amqqueue:get_pid(Q),
+    rabbit_fifo_client:update_machine_state(QPid, ra_machine_config(Q)).
 
 -spec cluster_state(Name :: atom()) -> 'down' | 'recovering' | 'running'.
 

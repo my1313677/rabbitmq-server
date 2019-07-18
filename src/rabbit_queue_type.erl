@@ -7,6 +7,7 @@
          is_enabled/1,
          declare/2,
          delete/4,
+         policy_changed/1,
          stat/1,
          name/2,
          info/2,
@@ -85,6 +86,8 @@
     rabbit_types:ok(non_neg_integer()) |
     rabbit_types:error(in_use | not_empty).
 
+-callback policy_changed(amqqueue:amqqueue()) -> ok.
+
 -callback consume(amqqueue:amqqueue(),
                   consume_spec(),
                   queue_state()) ->
@@ -121,6 +124,7 @@
                   rabbit_types:ctag(), queue_state()) ->
     {ok, Count :: non_neg_integer(), empty | rabbit_amqqueue:qmsg(),
      queue_state()}.
+
 
 %% return a map of state summary information
 -callback state_info(queue_state()) ->
@@ -159,6 +163,11 @@ delete(Q, IfUnused, IfEmpty, ActingUser) ->
     Mod = amqqueue:get_type(Q),
     Mod:delete(Q, IfUnused, IfEmpty, ActingUser).
 
+
+-spec policy_changed(amqqueue:amqqueue()) -> 'ok'.
+policy_changed(Q) ->
+    Mod = amqqueue:get_type(Q),
+    Mod:policy_changed(Q).
 
 -spec stat(amqqueue:amqqueue()) ->
     {'ok', non_neg_integer(), non_neg_integer()}.
@@ -267,6 +276,14 @@ handle_event(QRef, Evt, Ctxs) ->
     end.
 
 
+deliver(Qs, Delivery, stateless) ->
+    rabbit_log:info("rabbit queue type stateless deliver to ~w",
+                    [Qs]),
+    _ = lists:map(fun(Q) ->
+                          Mod = amqqueue:get_type(Q),
+                          _ = Mod:deliver([{Q, stateless}], Delivery)
+                  end, Qs),
+    {stateless, []};
 deliver(Qs, Delivery, Ctxs) ->
     %% sort by queue type - then dispatch each group
     ByType = lists:foldl(fun (Q, Acc) ->

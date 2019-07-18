@@ -36,7 +36,7 @@ publish(Msg, Reason, X, RK, QName) ->
     {Queues, Cycles} = detect_cycles(Reason, DLMsg,
                                      rabbit_exchange:route(X, Delivery)),
     lists:foreach(fun log_cycle_once/1, Cycles),
-    rabbit_amqqueue:deliver(rabbit_amqqueue:lookup(Queues), Delivery).
+    rabbit_queue_type:deliver(rabbit_amqqueue:lookup(Queues), Delivery, stateless).
 
 make_msg(Msg = #basic_message{content       = Content,
                               exchange_name = Exchange,

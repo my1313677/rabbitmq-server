@@ -15,6 +15,7 @@
          is_enabled/0,
          declare/2,
          delete/4,
+         policy_changed/1,
          stat/1,
          init/1,
          consume/3,
@@ -83,6 +84,11 @@ delete(Q, IfUnused, IfEmpty, ActingUser) when ?amqqueue_is_classic(Q) ->
             %% Assume the queue was deleted
             {ok, 0}
     end.
+
+-spec policy_changed(amqqueue:amqqueue()) -> ok.
+policy_changed(Q) ->
+    QPid = amqqueue:get_pid(Q),
+    gen_server2:cast(QPid, policy_changed).
 
 stat(Q) ->
     delegate:invoke(amqqueue:get_pid(Q),
@@ -153,12 +159,13 @@ handle_event(_Evt, State) ->
     {ok, State, []}.
 
 -spec deliver([{amqqueue:amqqueue(), state()}],
-                  Delivery :: term()) ->
+              Delivery :: term()) ->
     {[{amqqueue:amqqueue(), state()}], rabbit_queue_type:actions()}.
 deliver(Qs, #delivery{flow = Flow,
                       confirm = _Confirm} = Delivery) ->
     {MPids, SPids, Actions} = qpids(Qs),
     QPids = MPids ++ SPids,
+    rabbit_log:info("classic deliver to ~w", [QPids]),
     case Flow of
         %% Here we are tracking messages sent by the rabbit_channel
         %% process. We are accessing the rabbit_channel process
@@ -169,10 +176,8 @@ deliver(Qs, #delivery{flow = Flow,
     end,
     MMsg = {deliver, Delivery, false},
     SMsg = {deliver, Delivery, true},
-    rabbit_log:info("rabbit_classic_queue delivery confirm  ~w", [_Confirm, MMsg]),
     delegate:invoke_no_result(MPids, {gen_server2, cast, [MMsg]}),
     delegate:invoke_no_result(SPids, {gen_server2, cast, [SMsg]}),
-    %% TODO: monitors
     {Qs, Actions}.
 
 
