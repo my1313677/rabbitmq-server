@@ -598,8 +598,8 @@ infos(QName) ->
 
 
 
--spec stat(amqqueue:amqqueue()) -> {'ok', non_neg_integer(), non_neg_integer()}.
-
+-spec stat(amqqueue:amqqueue()) ->
+    {'ok', non_neg_integer(), non_neg_integer()}.
 stat(Q) when ?is_amqqueue(Q) ->
     Leader = amqqueue:get_pid(Q),
     try
@@ -610,7 +610,10 @@ stat(Q) when ?is_amqqueue(Q) ->
             {ok, 0, 0}
     end.
 
-purge(Node) ->
+-spec purge(amqqueue:amqqueue()) ->
+    {ok, non_neg_integer()}.
+purge(Q) when ?is_amqqueue(Q) ->
+    Node = amqqueue:get_pid(Q),
     rabbit_fifo_client:purge(Node).
 
 requeue(ConsumerTag, MsgIds, QState) ->
@@ -640,7 +643,6 @@ maybe_delete_data_dir(UId) ->
     end.
 
 policy_changed(Q) ->
-    rabbit_log:info("PLICY CHANGE ~w", [ra_machine_config(Q)]),
     QPid = amqqueue:get_pid(Q),
     rabbit_fifo_client:update_machine_state(QPid, ra_machine_config(Q)).
 
